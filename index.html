@@ -1,1020 +1,672 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Recovery Time Estimator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      html, body, #root { height: 100%; }
+      body { margin: 0; }
+    </style>
+  </head>
+  <body class="bg-slate-50">
+    <div id="root"></div>
 
-/**
- * Recovery Time Estimator — Dynamic AI-Style MVP (single-file)
- * -----------------------------------------------------------
- * A fully functional, client-side React app that:
- *  - Runs an adaptive interview (AI-style) using a question ontology & VoI heuristic
- *  - Scores capabilities from answers and evidence flags
- *  - Runs a Monte Carlo simulation to estimate recovery time (P50/P90)
- *  - Shows live deltas, histogram, sensitivity and a prioritized action list
- *  - Saves sessions to localStorage and supports export
- *
- * No external UI libs required. Tailwind classes for style.
- * You can drop this into any React environment. Default export renders the full app.
- */
+    <!-- React + Babel (for in-browser JSX transform) -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
 
-// ------------------------------ Utilities ------------------------------
+    <script type="text/babel">
+      const { useEffect, useMemo, useRef, useState } = React;
 
-function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
-function quantile(sortedArr, q) {
-  if (sortedArr.length === 0) return 0;
-  const pos = (sortedArr.length - 1) * q;
-  const base = Math.floor(pos);
-  const rest = pos - base;
-  if ((sortedArr[base + 1] !== undefined)) {
-    return sortedArr[base] + rest * (sortedArr[base + 1] - sortedArr[base]);
-  } else {
-    return sortedArr[base];
-  }
-}
-function mean(arr){ return arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0 }
-function stddev(arr){
-  if (arr.length < 2) return 0;
-  const m = mean(arr);
-  const v = mean(arr.map(x => (x - m) ** 2));
-  return Math.sqrt(v);
-}
-// Box-Muller transform
-function randn(){
-  let u = 0, v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-}
-function sampleTriangular(min, mode, max){
-  const u = Math.random();
-  const c = (mode - min) / (max - min);
-  if (u < c) return min + Math.sqrt(u * (max - min) * (mode - min));
-  return max - Math.sqrt((1 - u) * (max - min) * (max - mode));
-}
-function sampleLogNormal(mu, sigma){
-  return Math.exp(mu + sigma * randn());
-}
+      // ------------------------------ Utilities ------------------------------
+      const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+      function quantile(sortedArr, q) {
+        if (sortedArr.length === 0) return 0;
+        const pos = (sortedArr.length - 1) * q;
+        const base = Math.floor(pos);
+        const rest = pos - base;
+        if ((sortedArr[base + 1] !== undefined)) {
+          return sortedArr[base] + rest * (sortedArr[base + 1] - sortedArr[base]);
+        } else {
+          return sortedArr[base];
+        }
+      }
+      const mean = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0;
+      const stddev = arr => {
+        if (arr.length < 2) return 0;
+        const m = mean(arr);
+        const v = mean(arr.map(x => (x - m) ** 2));
+        return Math.sqrt(v);
+      }
+      function randn(){
+        let u = 0, v = 0;
+        while (u === 0) u = Math.random();
+        while (v === 0) v = Math.random();
+        return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+      }
+      function sampleTriangular(min, mode, max){
+        const u = Math.random();
+        const c = (mode - min) / (max - min);
+        if (u < c) return min + Math.sqrt(u * (max - min) * (mode - min));
+        return max - Math.sqrt((1 - u) * (max - min) * (max - mode));
+      }
+      function sampleLogNormal(mu, sigma){ return Math.exp(mu + sigma * randn()); }
+      function download(filename, content, type = "application/json"){
+        const blob = new Blob([content], { type });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = filename; a.click();
+        URL.revokeObjectURL(url);
+      }
 
-function download(filename, content, type = "application/json"){
-  const blob = new Blob([content], { type });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = filename; a.click();
-  URL.revokeObjectURL(url);
-}
+      // ------------------------------ Ontology & Question Bank ------------------------------
+      const TOPICS = [
+        "Backups & Restore",
+        "DR & Failover",
+        "Identity & Access",
+        "Endpoint & Detection",
+        "Network & Segmentation",
+        "SaaS Recovery",
+        "Governance & Comms",
+        "Vendors & Third-Parties",
+        "Runbooks & People",
+      ];
 
-// ------------------------------ Ontology & Question Bank ------------------------------
+      const CAPS = {
+        backups: "Backups & Restore",
+        dr: "DR & Failover",
+        identity: "Identity & Access",
+        edr: "Endpoint & Detection",
+        netseg: "Network & Segmentation",
+        saas: "SaaS Recovery",
+        gov: "Governance & Comms",
+        vendors: "Vendors & Third-Parties",
+        runbooks: "Runbooks & People",
+      };
 
-const TOPICS = [
-  "Backups & Restore",
-  "DR & Failover",
-  "Identity & Access",
-  "Endpoint & Detection",
-  "Network & Segmentation",
-  "SaaS Recovery",
-  "Governance & Comms",
-  "Vendors & Third-Parties",
-  "Runbooks & People",
-];
+      const questionBank = [
+        { id: "tier1_count", topic: CAPS.runbooks, text: "How many Tier-1 business services do you have?", type: "number", unit: "services", weight: 0.9, onAnswer: v => ({ tier1Count: clamp(Number(v)||0, 1, 50) }) },
+        { id: "total_tb", topic: CAPS.backups, text: "Roughly how much Tier-1 data needs restoring in a major incident?", type: "number", unit: "TB", weight: 0.95, onAnswer: v => ({ totalTB: clamp(Number(v)||0, 0.1, 10000) }) },
+        { id: "restore_concurrency", topic: CAPS.backups, text: "How many parallel restore streams can you sustain (IOPS, infra and staff)?", type: "number", unit: "streams", weight: 0.8, onAnswer: v => ({ concurrency: clamp(Number(v)||1, 1, 100) }) },
+        { id: "immutable_backups", topic: CAPS.backups, text: "Do you have immutable, offsite backups for Tier-1 systems?", type: "boolean", weight: 1.0, evidenceHint: "Screenshots or policy showing immutability (e.g., S3 Object Lock)", onAnswer: v => ({ immutableBackups: !!v }) },
+        { id: "restore_test_recency", topic: CAPS.backups, text: "When was your most recent full restore test for a Tier-1 system?", type: "single-select", options: ["<30 days", "30–90 days", ">90 days", "Never"], weight: 0.9, onAnswer: v => ({ restoreTestRecency: v }) },
+        { id: "xregion_dr", topic: CAPS.dr, text: "Is cross-region disaster recovery configured and rehearsed?", type: "single-select", options: ["No", "Configured but not rehearsed", "Rehearsed annually", "Rehearsed quarterly"], weight: 0.85, onAnswer: v => ({ crossRegionDR: v }) },
+        { id: "iam_mfa", topic: CAPS.identity, text: "Is MFA enforced for all admin accounts, with break-glass controls tested?", type: "boolean", weight: 0.7, onAnswer: v => ({ mfaAdmins: !!v }) },
+        { id: "edr_coverage", topic: CAPS.edr, text: "EDR/XDR coverage across endpoints and servers?", type: "single-select", options: ["<50%", "50–80%", ">80%"], weight: 0.7, onAnswer: v => ({ edrCoverage: v }) },
+        { id: "segmentation", topic: CAPS.netseg, text: "Is network segmentation in place to limit lateral movement between critical tiers?", type: "single-select", options: ["No", "Partially", "Strong (tiered, enforced)"], weight: 0.75, onAnswer: v => ({ segmentation: v }) },
+        { id: "saas_backup", topic: CAPS.saas, text: "Do you back up critical SaaS (e.g., M365/Google Workspace/Salesforce) with tested restores?", type: "single-select", options: ["No", "Backups only", "Backups + quarterly restore tests"], weight: 0.6, onAnswer: v => ({ saasBackup: v }) },
+        { id: "governance_decision_time", topic: CAPS.gov, text: "Do you have a crisis governance playbook with clear decision authority (who can pull the plug)?", type: "single-select", options: ["No", "Documented", "Documented + rehearsed"], weight: 0.65, onAnswer: v => ({ governanceMaturity: v }) },
+        { id: "vendor_slas", topic: CAPS.vendors, text: "Do your key vendors have incident SLAs (with named contacts) tested in exercises?", type: "single-select", options: ["No", "SLA only", "SLA + tested contacts"], weight: 0.6, onAnswer: v => ({ vendorSLA: v }) },
+        { id: "runbooks", topic: CAPS.runbooks, text: "Are technical recovery runbooks current (updated <90 days) and assigned owners?", type: "single-select", options: ["No", "Partial", "Yes, current and owned"], weight: 0.7, onAnswer: v => ({ runbooks: v }) },
+        { id: "staffing_sre", topic: CAPS.runbooks, text: "How many engineers can you dedicate to restore & validation concurrently?", type: "number", unit: "people", weight: 0.6, onAnswer: v => ({ staffCount: clamp(Number(v)||1, 1, 500) }) },
+        { id: "detect_mttd", topic: CAPS.edr, text: "Typical time to detect a major incident (MTTD)?", type: "single-select", options: ["<30 min", "30–120 min", ">2 hours"], weight: 0.6, onAnswer: v => ({ mttd: v }) },
+        { id: "contain_mttc", topic: CAPS.identity, text: "Typical time to contain identity compromise (MTTC) once detected?", type: "single-select", options: ["<2 hours", "2–6 hours", ">6 hours"], weight: 0.6, onAnswer: v => ({ mttc: v }) },
+        { id: "restore_throughput_tbph", topic: CAPS.backups, text: "Sustained restore throughput across infra? (TB per hour, realistic)", type: "number", unit: "TB/h", weight: 0.9, onAnswer: v => ({ tbph: clamp(Number(v)||0.1, 0.05, 1000) }) },
+        { id: "uat_cycles", topic: CAPS.runbooks, text: "How many validation/UAT cycles are required before go-live?", type: "number", unit: "cycles", weight: 0.5, onAnswer: v => ({ uatCycles: clamp(Number(v)||1, 1, 10) }) },
+        { id: "change_window", topic: CAPS.gov, text: "Can you approve emergency changes outside regular windows?", type: "boolean", weight: 0.5, onAnswer: v => ({ emergencyChange: !!v }) },
+        { id: "rto_target", topic: CAPS.runbooks, text: "Your current RTO target for Tier-1 services?", type: "number", unit: "hours", weight: 0.4, onAnswer: v => ({ rtoTarget: clamp(Number(v)||24, 1, 240) }) },
+        { id: "edr_signal_noise", topic: CAPS.edr, text: "Alert signal-to-noise (roughly):", type: "single-select", options: ["High noise", "Moderate", "Clean"], weight: 0.4, onAnswer: v => ({ edrNoise: v }) },
+        { id: "seg_zero_trust", topic: CAPS.netseg, text: "Any Zero Trust / strong auth between admin tiers?", type: "single-select", options: ["No", "Partial", "Strong"], weight: 0.4, onAnswer: v => ({ zeroTrust: v }) },
+        { id: "shadow_it", topic: CAPS.gov, text: "Prevalence of unmanaged shadow IT impacting recovery?", type: "single-select", options: ["High", "Some", "Low"], weight: 0.3, onAnswer: v => ({ shadowIT: v }) },
+        { id: "vendor_saas_critical", topic: CAPS.vendors, text: "Any single critical SaaS/vendor dependency without a documented fallback?", type: "boolean", weight: 0.55, onAnswer: v => ({ singleVendorRisk: !!v }) },
+        { id: "tabletop_recent", topic: CAPS.gov, text: "Have you run a crisis tabletop in the last 6 months?", type: "single-select", options: ["No", "Yes (single)", "Yes (multi-team)"], weight: 0.45, onAnswer: v => ({ tabletop: v }) },
+      ];
 
-/** Question schema
- * {
- *   id: string,
- *   topic: string,
- *   text: string,
- *   type: 'boolean'|'single-select'|'number',
- *   options?: string[],
- *   unit?: string, // for numbers
- *   weight: number, // Value-of-Information weight (0-1)
- *   evidenceHint?: string,
- *   // Mapping answer => capability adjustments or param flags
- *   onAnswer: (value, state) => Partial<DerivedState>
- * }
- */
+      const DEFAULT_STATE = {
+        tier1Count: undefined, totalTB: undefined, concurrency: 1,
+        immutableBackups: undefined, restoreTestRecency: undefined, crossRegionDR: undefined,
+        mfaAdmins: undefined, edrCoverage: undefined, segmentation: undefined,
+        saasBackup: undefined, governanceMaturity: undefined, vendorSLA: undefined,
+        runbooks: undefined, staffCount: 3, mttd: undefined, mttc: undefined, tbph: undefined,
+        uatCycles: 1, emergencyChange: undefined, rtoTarget: 24, edrNoise: undefined,
+        zeroTrust: undefined, shadowIT: undefined, singleVendorRisk: undefined, tabletop: undefined,
+        evidence: [],
+        whatIf: { addSREs: 0, forceImmutability: null, forceCrossRegion: null }
+      };
 
-// Capability names (scores 0..5)
-const CAPS = {
-  backups: "Backups & Restore",
-  dr: "DR & Failover",
-  identity: "Identity & Access",
-  edr: "Endpoint & Detection",
-  netseg: "Network & Segmentation",
-  saas: "SaaS Recovery",
-  gov: "Governance & Comms",
-  vendors: "Vendors & Third-Parties",
-  runbooks: "Runbooks & People",
-};
+      function capabilityScores(state){
+        const s = { backups:2.5, dr:2.5, identity:2.5, edr:2.5, netseg:2.5, saas:2.5, gov:2.5, vendors:2.5, runbooks:2.5 };
+        if (state.immutableBackups === true) s.backups += 1.5; else if (state.immutableBackups === false) s.backups -= 1.0;
+        if (state.restoreTestRecency){
+          if (state.restoreTestRecency === "<30 days") s.backups += 1.0;
+          if (state.restoreTestRecency === "30–90 days") s.backups += 0.5;
+          if (state.restoreTestRecency === ">90 days") s.backups -= 0.5;
+          if (state.restoreTestRecency === "Never") s.backups -= 1.5;
+        }
+        if (state.tbph && state.tbph >= 5) s.backups += 0.5;
 
-const questionBank = [
-  {
-    id: "tier1_count",
-    topic: CAPS.runbooks,
-    text: "How many Tier-1 business services do you have?",
-    type: "number",
-    unit: "services",
-    weight: 0.9,
-    onAnswer: (v) => ({ tier1Count: clamp(Number(v)||0, 1, 50) })
-  },
-  {
-    id: "total_tb",
-    topic: CAPS.backups,
-    text: "Roughly how much Tier-1 data needs restoring in a major incident?",
-    type: "number",
-    unit: "TB",
-    weight: 0.95,
-    onAnswer: (v) => ({ totalTB: clamp(Number(v)||0, 0.1, 10000) })
-  },
-  {
-    id: "restore_concurrency",
-    topic: CAPS.backups,
-    text: "How many parallel restore streams can you sustain (IOPS, infra and staff)?",
-    type: "number",
-    unit: "streams",
-    weight: 0.8,
-    onAnswer: (v) => ({ concurrency: clamp(Number(v)||1, 1, 100) })
-  },
-  {
-    id: "immutable_backups",
-    topic: CAPS.backups,
-    text: "Do you have immutable, offsite backups for Tier-1 systems?",
-    type: "boolean",
-    weight: 1.0,
-    evidenceHint: "Screenshots or policy showing immutability (e.g., S3 Object Lock)",
-    onAnswer: (v) => ({ immutableBackups: !!v })
-  },
-  {
-    id: "restore_test_recency",
-    topic: CAPS.backups,
-    text: "When was your most recent full restore test for a Tier-1 system?",
-    type: "single-select",
-    options: ["<30 days", "30–90 days", ">90 days", "Never"],
-    weight: 0.9,
-    onAnswer: (v) => ({ restoreTestRecency: v })
-  },
-  {
-    id: "xregion_dr",
-    topic: CAPS.dr,
-    text: "Is cross-region disaster recovery configured and rehearsed?",
-    type: "single-select",
-    options: ["No", "Configured but not rehearsed", "Rehearsed annually", "Rehearsed quarterly"],
-    weight: 0.85,
-    onAnswer: (v) => ({ crossRegionDR: v })
-  },
-  {
-    id: "iam_mfa",
-    topic: CAPS.identity,
-    text: "Is MFA enforced for all admin accounts, with break-glass controls tested?",
-    type: "boolean",
-    weight: 0.7,
-    onAnswer: (v) => ({ mfaAdmins: !!v })
-  },
-  {
-    id: "edr_coverage",
-    topic: CAPS.edr,
-    text: "EDR/XDR coverage across endpoints and servers?",
-    type: "single-select",
-    options: ["<50%", "50–80%", ">80%"],
-    weight: 0.7,
-    onAnswer: (v) => ({ edrCoverage: v })
-  },
-  {
-    id: "segmentation",
-    topic: CAPS.netseg,
-    text: "Is network segmentation in place to limit lateral movement between critical tiers?",
-    type: "single-select",
-    options: ["No", "Partially", "Strong (tiered, enforced)"],
-    weight: 0.75,
-    onAnswer: (v) => ({ segmentation: v })
-  },
-  {
-    id: "saas_backup",
-    topic: CAPS.saas,
-    text: "Do you back up critical SaaS (e.g., M365/Google Workspace/Salesforce) with tested restores?",
-    type: "single-select",
-    options: ["No", "Backups only", "Backups + quarterly restore tests"],
-    weight: 0.6,
-    onAnswer: (v) => ({ saasBackup: v })
-  },
-  {
-    id: "governance_decision_time",
-    topic: CAPS.gov,
-    text: "Do you have a crisis governance playbook with clear decision authority (who can pull the plug)?",
-    type: "single-select",
-    options: ["No", "Documented", "Documented + rehearsed"],
-    weight: 0.65,
-    onAnswer: (v) => ({ governanceMaturity: v })
-  },
-  {
-    id: "vendor_slas",
-    topic: CAPS.vendors,
-    text: "Do your key vendors have incident SLAs (with named contacts) tested in exercises?",
-    type: "single-select",
-    options: ["No", "SLA only", "SLA + tested contacts"],
-    weight: 0.6,
-    onAnswer: (v) => ({ vendorSLA: v })
-  },
-  {
-    id: "runbooks",
-    topic: CAPS.runbooks,
-    text: "Are technical recovery runbooks current (updated <90 days) and assigned owners?",
-    type: "single-select",
-    options: ["No", "Partial", "Yes, current and owned"],
-    weight: 0.7,
-    onAnswer: (v) => ({ runbooks: v })
-  },
-  {
-    id: "staffing_sre",
-    topic: CAPS.runbooks,
-    text: "How many engineers can you dedicate to restore & validation concurrently?",
-    type: "number",
-    unit: "people",
-    weight: 0.6,
-    onAnswer: (v) => ({ staffCount: clamp(Number(v)||1, 1, 500) })
-  },
-  {
-    id: "detect_mttd",
-    topic: CAPS.edr,
-    text: "Typical time to detect a major incident (MTTD)?",
-    type: "single-select",
-    options: ["<30 min", "30–120 min", ">2 hours"],
-    weight: 0.6,
-    onAnswer: (v) => ({ mttd: v })
-  },
-  {
-    id: "contain_mttc",
-    topic: CAPS.identity,
-    text: "Typical time to contain identity compromise (MTTC) once detected?",
-    type: "single-select",
-    options: ["<2 hours", "2–6 hours", ">6 hours"],
-    weight: 0.6,
-    onAnswer: (v) => ({ mttc: v })
-  },
-  {
-    id: "restore_throughput_tbph",
-    topic: CAPS.backups,
-    text: "Sustained restore throughput across infra? (TB per hour, realistic)",
-    type: "number",
-    unit: "TB/h",
-    weight: 0.9,
-    onAnswer: (v) => ({ tbph: clamp(Number(v)||0.1, 0.05, 1000) })
-  },
-  {
-    id: "uat_cycles",
-    topic: CAPS.runbooks,
-    text: "How many validation/UAT cycles are required before go-live?",
-    type: "number",
-    unit: "cycles",
-    weight: 0.5,
-    onAnswer: (v) => ({ uatCycles: clamp(Number(v)||1, 1, 10) })
-  },
-  {
-    id: "change_window",
-    topic: CAPS.gov,
-    text: "Can you approve emergency changes outside regular windows?",
-    type: "boolean",
-    weight: 0.5,
-    onAnswer: (v) => ({ emergencyChange: !!v })
-  },
-  {
-    id: "rto_target",
-    topic: CAPS.runbooks,
-    text: "Your current RTO target for Tier-1 services?",
-    type: "number",
-    unit: "hours",
-    weight: 0.4,
-    onAnswer: (v) => ({ rtoTarget: clamp(Number(v)||24, 1, 240) })
-  },
-  {
-    id: "edr_signal_noise",
-    topic: CAPS.edr,
-    text: "Alert signal-to-noise (roughly):",
-    type: "single-select",
-    options: ["High noise", "Moderate", "Clean"],
-    weight: 0.4,
-    onAnswer: (v) => ({ edrNoise: v })
-  },
-  {
-    id: "seg_zero_trust",
-    topic: CAPS.netseg,
-    text: "Any Zero Trust / strong auth between admin tiers?",
-    type: "single-select",
-    options: ["No", "Partial", "Strong"],
-    weight: 0.4,
-    onAnswer: (v) => ({ zeroTrust: v })
-  },
-  {
-    id: "shadow_it",
-    topic: CAPS.gov,
-    text: "Prevalence of unmanaged shadow IT impacting recovery?",
-    type: "single-select",
-    options: ["High", "Some", "Low"],
-    weight: 0.3,
-    onAnswer: (v) => ({ shadowIT: v })
-  },
-  {
-    id: "vendor_saas_critical",
-    topic: CAPS.vendors,
-    text: "Any single critical SaaS/vendor dependency without a documented fallback?",
-    type: "boolean",
-    weight: 0.55,
-    onAnswer: (v) => ({ singleVendorRisk: !!v })
-  },
-  {
-    id: "tabletop_recent",
-    topic: CAPS.gov,
-    text: "Have you run a crisis tabletop in the last 6 months?",
-    type: "single-select",
-    options: ["No", "Yes (single)", "Yes (multi-team)"],
-    weight: 0.45,
-    onAnswer: (v) => ({ tabletop: v })
-  },
-];
+        if (state.crossRegionDR){
+          if (state.crossRegionDR === "Configured but not rehearsed") s.dr += 0.3;
+          if (state.crossRegionDR === "Rehearsed annually") s.dr += 0.8;
+          if (state.crossRegionDR === "Rehearsed quarterly") s.dr += 1.4;
+          if (state.crossRegionDR === "No") s.dr -= 0.8;
+        }
 
-// ------------------------------ Derived State & Scoring ------------------------------
+        if (state.mfaAdmins === true) s.identity += 0.8; else if (state.mfaAdmins === false) s.identity -= 0.8;
+        if (state.mttc){
+          if (state.mttc === "<2 hours") s.identity += 0.6;
+          if (state.mttc === "2–6 hours") s.identity += 0.2;
+          if (state.mttc === ">6 hours") s.identity -= 0.6;
+        }
+        if (state.zeroTrust){
+          if (state.zeroTrust === "Strong") s.identity += 0.4;
+          if (state.zeroTrust === "No") s.identity -= 0.4;
+        }
 
-const DEFAULT_STATE = {
-  // Inputs
-  tier1Count: undefined,
-  totalTB: undefined,
-  concurrency: 1,
-  immutableBackups: undefined,
-  restoreTestRecency: undefined,
-  crossRegionDR: undefined,
-  mfaAdmins: undefined,
-  edrCoverage: undefined,
-  segmentation: undefined,
-  saasBackup: undefined,
-  governanceMaturity: undefined,
-  vendorSLA: undefined,
-  runbooks: undefined,
-  staffCount: 3,
-  mttd: undefined,
-  mttc: undefined,
-  tbph: undefined,
-  uatCycles: 1,
-  emergencyChange: undefined,
-  rtoTarget: 24,
-  edrNoise: undefined,
-  zeroTrust: undefined,
-  shadowIT: undefined,
-  singleVendorRisk: undefined,
-  tabletop: undefined,
+        if (state.edrCoverage){
+          if (state.edrCoverage === ">80%") s.edr += 0.8;
+          if (state.edrCoverage === "50–80%") s.edr += 0.3;
+          if (state.edrCoverage === "<50%") s.edr -= 0.6;
+        }
+        if (state.mttd){
+          if (state.mttd === "<30 min") s.edr += 0.6;
+          if (state.mttd === "30–120 min") s.edr += 0.2;
+          if (state.mttd === ">2 hours") s.edr -= 0.6;
+        }
+        if (state.edrNoise){
+          if (state.edrNoise === "Clean") s.edr += 0.3;
+          if (state.edrNoise === "High noise") s.edr -= 0.3;
+        }
 
-  // Evidence (stubbed)
-  evidence: [], // {name, size}
+        if (state.segmentation){
+          if (state.segmentation === "Strong (tiered, enforced)") s.netseg += 1.0;
+          if (state.segmentation === "Partially") s.netseg += 0.3;
+          if (state.segmentation === "No") s.netseg -= 0.8;
+        }
 
-  // What-if overrides
-  whatIf: {
-    addSREs: 0, // additional staff affecting concurrency
-    forceImmutability: null, // boolean | null
-    forceCrossRegion: null, // string | null (matches options)
-  }
-};
+        if (state.saasBackup){
+          if (state.saasBackup === "Backups + quarterly restore tests") s.saas += 1.0;
+          if (state.saasBackup === "Backups only") s.saas += 0.2;
+          if (state.saasBackup === "No") s.saas -= 0.7;
+        }
 
-function capabilityScores(state){
-  // Base 2.5 (middle). Adjust by answers.
-  const s = {
-    backups: 2.5,
-    dr: 2.5,
-    identity: 2.5,
-    edr: 2.5,
-    netseg: 2.5,
-    saas: 2.5,
-    gov: 2.5,
-    vendors: 2.5,
-    runbooks: 2.5,
-  };
-  // Backups & Restore
-  if (state.immutableBackups === true) s.backups += 1.5; else if (state.immutableBackups === false) s.backups -= 1.0;
-  if (state.restoreTestRecency){
-    if (state.restoreTestRecency === "<30 days") s.backups += 1.0;
-    if (state.restoreTestRecency === "30–90 days") s.backups += 0.5;
-    if (state.restoreTestRecency === ">90 days") s.backups -= 0.5;
-    if (state.restoreTestRecency === "Never") s.backups -= 1.5;
-  }
-  if (state.tbph && state.tbph >= 5) s.backups += 0.5;
+        if (state.governanceMaturity){
+          if (state.governanceMaturity === "Documented + rehearsed") s.gov += 1.0;
+          if (state.governanceMaturity === "Documented") s.gov += 0.3;
+          if (state.governanceMaturity === "No") s.gov -= 0.7;
+        }
+        if (state.emergencyChange === true) s.gov += 0.3; else if (state.emergencyChange === false) s.gov -= 0.2;
+        if (state.tabletop){
+          if (state.tabletop === "Yes (multi-team)") s.gov += 0.4;
+          if (state.tabletop === "No") s.gov -= 0.3;
+        }
 
-  // DR & Failover
-  if (state.crossRegionDR){
-    if (state.crossRegionDR === "Configured but not rehearsed") s.dr += 0.3;
-    if (state.crossRegionDR === "Rehearsed annually") s.dr += 0.8;
-    if (state.crossRegionDR === "Rehearsed quarterly") s.dr += 1.4;
-    if (state.crossRegionDR === "No") s.dr -= 0.8;
-  }
+        if (state.vendorSLA){
+          if (state.vendorSLA === "SLA + tested contacts") s.vendors += 0.8;
+          if (state.vendorSLA === "SLA only") s.vendors += 0.2;
+          if (state.vendorSLA === "No") s.vendors -= 0.6;
+        }
+        if (state.singleVendorRisk === true) s.vendors -= 0.6;
 
-  // Identity & Access
-  if (state.mfaAdmins === true) s.identity += 0.8; else if (state.mfaAdmins === false) s.identity -= 0.8;
-  if (state.mttc){
-    if (state.mttc === "<2 hours") s.identity += 0.6;
-    if (state.mttc === "2–6 hours") s.identity += 0.2;
-    if (state.mttc === ">6 hours") s.identity -= 0.6;
-  }
-  if (state.zeroTrust){
-    if (state.zeroTrust === "Strong") s.identity += 0.4;
-    if (state.zeroTrust === "No") s.identity -= 0.4;
-  }
+        if (state.runbooks){
+          if (state.runbooks === "Yes, current and owned") s.runbooks += 1.0;
+          if (state.runbooks === "Partial") s.runbooks += 0.2;
+          if (state.runbooks === "No") s.runbooks -= 0.7;
+        }
+        if (state.staffCount && state.staffCount >= 8) s.runbooks += 0.2;
 
-  // EDR
-  if (state.edrCoverage){
-    if (state.edrCoverage === ">80%") s.edr += 0.8;
-    if (state.edrCoverage === "50–80%") s.edr += 0.3;
-    if (state.edrCoverage === "<50%") s.edr -= 0.6;
-  }
-  if (state.mttd){
-    if (state.mttd === "<30 min") s.edr += 0.6;
-    if (state.mttd === "30–120 min") s.edr += 0.2;
-    if (state.mttd === ">2 hours") s.edr -= 0.6;
-  }
-  if (state.edrNoise){
-    if (state.edrNoise === "Clean") s.edr += 0.3;
-    if (state.edrNoise === "High noise") s.edr -= 0.3;
-  }
+        Object.keys(s).forEach(k => s[k] = clamp(s[k], 0, 5));
+        return s;
+      }
 
-  // Network Segmentation
-  if (state.segmentation){
-    if (state.segmentation === "Strong (tiered, enforced)") s.netseg += 1.0;
-    if (state.segmentation === "Partially") s.netseg += 0.3;
-    if (state.segmentation === "No") s.netseg -= 0.8;
-  }
+      function deriveParams(state){
+        const caps = capabilityScores(state);
+        const scale = (score, low, high) => low + (high - low) * (score / 5);
 
-  // SaaS
-  if (state.saasBackup){
-    if (state.saasBackup === "Backups + quarterly restore tests") s.saas += 1.0;
-    if (state.saasBackup === "Backups only") s.saas += 0.2;
-    if (state.saasBackup === "No") s.saas -= 0.7;
-  }
+        const detectModeMin = scale(caps.edr, 240, 30);
+        const detectMin = clamp(detectModeMin * 0.25, 5, 120);
+        const detectMax = clamp(detectModeMin * 4, 60, 720);
 
-  // Governance
-  if (state.governanceMaturity){
-    if (state.governanceMaturity === "Documented + rehearsed") s.gov += 1.0;
-    if (state.governanceMaturity === "Documented") s.gov += 0.3;
-    if (state.governanceMaturity === "No") s.gov -= 0.7;
-  }
-  if (state.emergencyChange === true) s.gov += 0.3; else if (state.emergencyChange === false) s.gov -= 0.2;
-  if (state.tabletop){
-    if (state.tabletop === "Yes (multi-team)") s.gov += 0.4;
-    if (state.tabletop === "No") s.gov -= 0.3;
-  }
+        const govMode = scale(caps.gov, 180, 30);
+        const govMin = clamp(govMode * 0.4, 10, 90);
+        const govMax = clamp(govMode * 2.5, 60, 600);
 
-  // Vendors
-  if (state.vendorSLA){
-    if (state.vendorSLA === "SLA + tested contacts") s.vendors += 0.8;
-    if (state.vendorSLA === "SLA only") s.vendors += 0.2;
-    if (state.vendorSLA === "No") s.vendors -= 0.6;
-  }
-  if (state.singleVendorRisk === true) s.vendors -= 0.6;
+        const containBaseMu = Math.log(scale(caps.identity, 14, 3));
+        const containSigma = scale(caps.netseg, 0.8, 0.3);
 
-  // Runbooks & People
-  if (state.runbooks){
-    if (state.runbooks === "Yes, current and owned") s.runbooks += 1.0;
-    if (state.runbooks === "Partial") s.runbooks += 0.2;
-    if (state.runbooks === "No") s.runbooks -= 0.7;
-  }
-  if (state.staffCount && state.staffCount >= 8) s.runbooks += 0.2;
+        const totalTB = state.totalTB || 10;
+        const tbph = Math.max(0.05, state.tbph || 0.5);
+        const baseConcurrency = Math.max(1, Math.floor(state.concurrency || 1));
+        const extraSRE = state.whatIf.addSREs || 0;
+        const staffGate = Math.max(1, Math.floor((state.staffCount || 3) / 2));
+        const concurrency = Math.max(1, Math.min(baseConcurrency + extraSRE, staffGate));
+        const immut = (state.whatIf.forceImmutability !== null) ? state.whatIf.forceImmutability : state.immutableBackups;
+        const reworkProb = immut === true ? 0.06 : immut === false ? 0.28 : 0.15;
 
-  // Clamp 0..5
-  Object.keys(s).forEach(k => s[k] = clamp(s[k], 0, 5));
-  return s;
-}
+        let reworkMult = 1.0;
+        if (state.restoreTestRecency === "<30 days") reworkMult = 0.6;
+        else if (state.restoreTestRecency === "30–90 days") reworkMult = 0.8;
+        else if (state.restoreTestRecency === ">90 days") reworkMult = 1.2;
+        else if (state.restoreTestRecency === "Never") reworkMult = 1.6;
 
-// Map capability scores -> simulation parameter multipliers
-function deriveParams(state){
-  const caps = capabilityScores(state);
+        const xregion = (state.whatIf.forceCrossRegion !== null) ? state.whatIf.forceCrossRegion : state.crossRegionDR;
+        let cutoverHours = 6;
+        if (xregion === "No" || !xregion) cutoverHours = 10;
+        if (xregion === "Configured but not rehearsed") cutoverHours = 8;
+        if (xregion === "Rehearsed annually") cutoverHours = 5;
+        if (xregion === "Rehearsed quarterly") cutoverHours = 3.5;
 
-  // helper: map 0..5 -> [low, high]
-  const scale = (score, low, high) => low + (high - low) * (score / 5);
+        let saasHours = 4;
+        if (state.saasBackup === "Backups + quarterly restore tests") saasHours = 2;
+        if (state.saasBackup === "Backups only") saasHours = 3.5;
+        if (state.saasBackup === "No") saasHours = 8;
 
-  // Detect/Decide (minutes)
-  const detectModeMin = scale(caps.edr, 240, 30); // better EDR -> faster detection
-  const detectMin = clamp(detectModeMin * 0.25, 5, 120);
-  const detectMax = clamp(detectModeMin * 4, 60, 720);
+        const uatPer = 2.0 * (1 + (state.shadowIT === "High" ? 0.5 : state.shadowIT === "Some" ? 0.2 : 0));
+        const uatCycles = Math.max(1, state.uatCycles || 1);
 
-  // Governance delay (minutes)
-  const govMode = scale(caps.gov, 180, 30);
-  const govMin = clamp(govMode * 0.4, 10, 90);
-  const govMax = clamp(govMode * 2.5, 60, 600);
+        const vendorDelay = state.vendorSLA === "SLA + tested contacts" ? 0.5 : state.vendorSLA === "SLA only" ? 2 : state.vendorSLA === "No" ? 6 : 3;
+        const singleVendorPenalty = state.singleVendorRisk ? 4 : 0;
 
-  // Contain/Eradicate (hours) via lognormal
-  const containBaseMu = Math.log(scale(caps.identity, 14, 3)); // median hours
-  const containSigma = scale(caps.netseg, 0.8, 0.3); // better netseg -> less variance
+        return {
+          detect: { min: detectMin, mode: detectModeMin, max: detectMax },
+          governance: { min: govMin, mode: govMode, max: govMax },
+          contain: { mu: Math.log(1) + containBaseMu, sigma: containSigma },
+          restore: { totalTB, tbph, concurrency, reworkProb, reworkMult },
+          cutoverHours,
+          saasHours,
+          uatHours: uatPer * uatCycles,
+          vendorHours: vendorDelay + singleVendorPenalty,
+        };
+      }
 
-  // Restore
-  const totalTB = state.totalTB || 10;
-  const tbph = Math.max(0.05, state.tbph || 0.5);
-  const baseConcurrency = Math.max(1, Math.floor(state.concurrency || 1));
-  const extraSRE = state.whatIf.addSREs || 0;
-  const staffGate = Math.max(1, Math.floor((state.staffCount || 3) / 2)); // 2 eng per stream
-  const concurrency = Math.max(1, Math.min(baseConcurrency + extraSRE, staffGate));
-  const immut = (state.whatIf.forceImmutability !== null) ? state.whatIf.forceImmutability : state.immutableBackups;
-  const reworkProb = immut === true ? 0.06 : immut === false ? 0.28 : 0.15; // unknown -> mid
+      function runSimulation(state, runs = 2000){
+        const p = deriveParams(state);
+        const samples = [];
+        for (let i = 0; i < runs; i++){
+          const tDetectMin = sampleTriangular(p.detect.min, p.detect.mode, p.detect.max) / 60;
+          const tGovMin = sampleTriangular(p.governance.min, p.governance.mode, p.governance.max) / 60;
+          const tContain = sampleLogNormal(p.contain.mu, p.contain.sigma);
+          const effectiveTBph = p.restore.tbph * Math.max(1, p.restore.concurrency);
+          const restoreCore = p.restore.totalTB / effectiveTBph;
+          const reworkHappens = Math.random() < p.restore.reworkProb;
+          const reworkHours = reworkHappens ? sampleTriangular(1, 3, 10) * p.restore.reworkMult : 0;
+          const tSaaS = sampleTriangular(Math.max(1, p.saasHours*0.6), p.saasHours, p.saasHours*1.5);
+          const tVendor = sampleTriangular(Math.max(0.2, p.vendorHours*0.5), p.vendorHours, p.vendorHours*1.5);
+          const tUAT = sampleTriangular(Math.max(0.5, p.uatHours*0.6), p.uatHours, p.uatHours*1.5);
+          const tCutover = sampleTriangular(Math.max(1, p.cutoverHours*0.5), p.cutoverHours, p.cutoverHours*1.5);
+          const tPhase1 = tDetectMin + tGovMin;
+          const tPhase2 = tContain;
+          const tPhase3 = Math.max(restoreCore + reworkHours, tSaaS + tVendor);
+          const tPhase4 = tUAT + tCutover;
+          const total = tPhase1 + tPhase2 + tPhase3 + tPhase4;
+          samples.push(total);
+        }
+        samples.sort((a,b)=>a-b);
+        const p50 = quantile(samples, 0.5);
+        const p90 = quantile(samples, 0.9);
+        const avg = mean(samples);
+        const sd = stddev(samples);
+        return { samples, p50, p90, mean: avg, sd, params: p };
+      }
 
-  // Restore rework time multiplier from test recency
-  let reworkMult = 1.0;
-  if (state.restoreTestRecency === "<30 days") reworkMult = 0.6;
-  else if (state.restoreTestRecency === "30–90 days") reworkMult = 0.8;
-  else if (state.restoreTestRecency === ">90 days") reworkMult = 1.2;
-  else if (state.restoreTestRecency === "Never") reworkMult = 1.6;
+      const SENSITIVITY_KNOBS = [
+        { key: "immutableBackups", label: "Enable immutable backups", on: true, off: false },
+        { key: "crossRegionDR", label: "Rehearse cross-region quarterly", value: "Rehearsed quarterly" },
+        { key: "restoreTestRecency", label: "Run restore tests <30 days", value: "<30 days" },
+        { key: "tbph", label: "Increase restore throughput to 5 TB/h", value: 5 },
+        { key: "concurrency", label: "Increase restore concurrency by +2", delta: 2 },
+        { key: "mttd", label: "Improve MTTD to <30 min", value: "<30 min" },
+        { key: "mttc", label: "Improve MTTC to <2 hours", value: "<2 hours" },
+        { key: "vendorSLA", label: "Test vendor contacts with SLAs", value: "SLA + tested contacts" },
+      ];
 
-  // Cross-region cutover
-  const xregion = (state.whatIf.forceCrossRegion !== null) ? state.whatIf.forceCrossRegion : state.crossRegionDR;
-  let cutoverHours = 6; // default
-  if (xregion === "No" || !xregion) cutoverHours = 10;
-  if (xregion === "Configured but not rehearsed") cutoverHours = 8;
-  if (xregion === "Rehearsed annually") cutoverHours = 5;
-  if (xregion === "Rehearsed quarterly") cutoverHours = 3.5;
+      function sensitivityAnalysis(baseState){
+        const base = runSimulation(baseState, 800);
+        const results = [];
+        for (const knob of SENSITIVITY_KNOBS){
+          const s = JSON.parse(JSON.stringify(baseState));
+          if (Object.prototype.hasOwnProperty.call(knob, "on")) s[knob.key] = knob.on;
+          else if (Object.prototype.hasOwnProperty.call(knob, "off")) s[knob.key] = knob.off;
+          else if (Object.prototype.hasOwnProperty.call(knob, "delta")) s[knob.key] = Math.max(1, (s[knob.key]||0) + knob.delta);
+          else s[knob.key] = knob.value;
+          const sim = runSimulation(s, 600);
+          results.push({ label: knob.label, deltaP90: base.p90 - sim.p90, newP90: sim.p90 });
+        }
+        results.sort((a,b)=>b.deltaP90 - a.deltaP90);
+        return { base, results };
+      }
 
-  // SaaS outage component (email/collab) in hours
-  let saasHours = 4;
-  if (state.saasBackup === "Backups + quarterly restore tests") saasHours = 2;
-  if (state.saasBackup === "Backups only") saasHours = 3.5;
-  if (state.saasBackup === "No") saasHours = 8;
+      function unansweredQuestions(state, askedSet){
+        return questionBank.filter(q => !askedSet.current.has(q.id));
+      }
+      function estimateVoI(q, state){
+        const key = keyMap(q.id);
+        const unknown = state[key] === undefined || state[key] === null;
+        const base = q.weight || 0.5;
+        return base * (unknown ? 1.0 : 0.2);
+      }
+      function keyMap(id){
+        const mapping = {
+          tier1_count: "tier1Count", total_tb: "totalTB", restore_concurrency: "concurrency",
+          immutable_backups: "immutableBackups", restore_test_recency: "restoreTestRecency", xregion_dr: "crossRegionDR",
+          iam_mfa: "mfaAdmins", edr_coverage: "edrCoverage", segmentation: "segmentation", saas_backup: "saasBackup",
+          governance_decision_time: "governanceMaturity", vendor_slas: "vendorSLA", runbooks: "runbooks",
+          staffing_sre: "staffCount", detect_mttd: "mttd", contain_mttc: "mttc", restore_throughput_tbph: "tbph",
+          uat_cycles: "uatCycles", change_window: "emergencyChange", rto_target: "rtoTarget", edr_signal_noise: "edrNoise",
+          seg_zero_trust: "zeroTrust", shadow_it: "shadowIT", vendor_saas_critical: "singleVendorRisk", tabletop_recent: "tabletop",
+        };
+        return mapping[id] || id;
+      }
+      function pickNextQuestion(state, askedSet){
+        const remaining = unansweredQuestions(state, askedSet);
+        if (remaining.length === 0) return null;
+        const scored = remaining.map(q => ({ q, voi: estimateVoI(q, state) }));
+        scored.sort((a,b)=> b.voi - a.voi);
+        const imm = state.immutableBackups;
+        if (imm === false){
+          const pri = scored.find(s => ["restore_test_recency","restore_throughput_tbph"].includes(s.q.id));
+          if (pri) return pri.q;
+        }
+        return scored[0].q;
+      }
 
-  // UAT / validation per cycle in hours influenced by runbooks + vendors
-  const uatPer = 2.0 * (1 + (state.shadowIT === "High" ? 0.5 : state.shadowIT === "Some" ? 0.2 : 0));
-  const uatCycles = Math.max(1, state.uatCycles || 1);
-
-  const vendorDelay = state.vendorSLA === "SLA + tested contacts" ? 0.5 : state.vendorSLA === "SLA only" ? 2 : state.vendorSLA === "No" ? 6 : 3; // hours
-  const singleVendorPenalty = state.singleVendorRisk ? 4 : 0; // hours
-
-  return {
-    detect: { min: detectMin, mode: detectModeMin, max: detectMax }, // minutes
-    governance: { min: govMin, mode: govMode, max: govMax }, // minutes
-    contain: { mu: Math.log(1) + containBaseMu, sigma: containSigma }, // hours (lognormal median around scale)
-    restore: { totalTB, tbph, concurrency, reworkProb, reworkMult },
-    cutoverHours,
-    saasHours,
-    uatHours: uatPer * uatCycles,
-    vendorHours: vendorDelay + singleVendorPenalty,
-  };
-}
-
-// ------------------------------ Monte Carlo Simulation ------------------------------
-
-function runSimulation(state, runs = 2000){
-  const p = deriveParams(state);
-  const samples = [];
-
-  for (let i = 0; i < runs; i++){
-    // Detect + Governance (minutes) -> convert to hours
-    const tDetectMin = sampleTriangular(p.detect.min, p.detect.mode, p.detect.max) / 60;
-    const tGovMin = sampleTriangular(p.governance.min, p.governance.mode, p.governance.max) / 60;
-
-    // Contain/Eradicate (hours)
-    const tContain = sampleLogNormal(p.contain.mu, p.contain.sigma);
-
-    // Restore baseline
-    const effectiveTBph = p.restore.tbph * Math.max(1, p.restore.concurrency);
-    const restoreCore = p.restore.totalTB / effectiveTBph; // hours
-
-    // Potential rework
-    const reworkHappens = Math.random() < p.restore.reworkProb;
-    const reworkHours = reworkHappens ? sampleTriangular(1, 3, 10) * p.restore.reworkMult : 0;
-
-    // SaaS + Vendor + UAT + Cutover
-    const tSaaS = sampleTriangular(Math.max(1, p.saasHours*0.6), p.saasHours, p.saasHours*1.5);
-    const tVendor = sampleTriangular(Math.max(0.2, p.vendorHours*0.5), p.vendorHours, p.vendorHours*1.5);
-    const tUAT = sampleTriangular(Math.max(0.5, p.uatHours*0.6), p.uatHours, p.uatHours*1.5);
-    const tCutover = sampleTriangular(Math.max(1, p.cutoverHours*0.5), p.cutoverHours, p.cutoverHours*1.5);
-
-    // Parallelism simplification: Detect+Gov → Contain → Restore (in parallel with some SaaS/vendor) → UAT → Cutover
-    const tPhase1 = tDetectMin + tGovMin;
-    const tPhase2 = tContain;
-    const tPhase3 = Math.max(restoreCore + reworkHours, tSaaS + tVendor); // take longer of data restore vs external work
-    const tPhase4 = tUAT + tCutover;
-
-    const total = tPhase1 + tPhase2 + tPhase3 + tPhase4; // hours
-    samples.push(total);
-  }
-
-  samples.sort((a,b)=>a-b);
-  const p50 = quantile(samples, 0.5);
-  const p90 = quantile(samples, 0.9);
-  const avg = mean(samples);
-  const sd = stddev(samples);
-
-  return { samples, p50, p90, mean: avg, sd, params: p };
-}
-
-// ------------------------------ Sensitivity (What shortens RTO?) ------------------------------
-
-const SENSITIVITY_KNOBS = [
-  { key: "immutableBackups", label: "Enable immutable backups", on: true, off: false },
-  { key: "crossRegionDR", label: "Rehearse cross-region quarterly", value: "Rehearsed quarterly" },
-  { key: "restoreTestRecency", label: "Run restore tests <30 days", value: "<30 days" },
-  { key: "tbph", label: "Increase restore throughput to 5 TB/h", value: 5 },
-  { key: "concurrency", label: "Increase restore concurrency by +2", delta: 2 },
-  { key: "mttd", label: "Improve MTTD to <30 min", value: "<30 min" },
-  { key: "mttc", label: "Improve MTTC to <2 hours", value: "<2 hours" },
-  { key: "vendorSLA", label: "Test vendor contacts with SLAs", value: "SLA + tested contacts" },
-];
-
-function sensitivityAnalysis(baseState){
-  const base = runSimulation(baseState, 800); // quicker for sensitivity
-  const results = [];
-  for (const knob of SENSITIVITY_KNOBS){
-    const s = JSON.parse(JSON.stringify(baseState));
-    if (knob.hasOwnProperty("on")) s[knob.key] = knob.on; 
-    else if (knob.hasOwnProperty("off")) s[knob.key] = knob.off; 
-    else if (knob.hasOwnProperty("delta")) s[knob.key] = Math.max(1, (s[knob.key]||0) + knob.delta);
-    else s[knob.key] = knob.value;
-    const sim = runSimulation(s, 600);
-    results.push({ label: knob.label, deltaP90: base.p90 - sim.p90, newP90: sim.p90 });
-  }
-  results.sort((a,b)=>b.deltaP90 - a.deltaP90);
-  return { base, results };
-}
-
-// ------------------------------ Adaptive Question Engine (VoI) ------------------------------
-
-function unansweredQuestions(state, askedSet){
-  return questionBank.filter(q => !askedSet.current.has(q.id));
-}
-function estimateVoI(q, state){
-  // Heuristic: weight * (importance of the downstream param uncertainty)
-  // Boost VoI if the related input not yet set.
-  const key = q.id;
-  const unknown = state[keyMap(key)] === undefined || state[keyMap(key)] === null;
-  const base = q.weight || 0.5;
-  return base * (unknown ? 1.0 : 0.2);
-}
-function keyMap(id){
-  // In this MVP the id matches state keys for simplicity where possible
-  const mapping = {
-    tier1_count: "tier1Count",
-    total_tb: "totalTB",
-    restore_concurrency: "concurrency",
-    immutable_backups: "immutableBackups",
-    restore_test_recency: "restoreTestRecency",
-    xregion_dr: "crossRegionDR",
-    iam_mfa: "mfaAdmins",
-    edr_coverage: "edrCoverage",
-    segmentation: "segmentation",
-    saas_backup: "saasBackup",
-    governance_decision_time: "governanceMaturity",
-    vendor_slas: "vendorSLA",
-    runbooks: "runbooks",
-    staffing_sre: "staffCount",
-    detect_mttd: "mttd",
-    contain_mttc: "mttc",
-    restore_throughput_tbph: "tbph",
-    uat_cycles: "uatCycles",
-    change_window: "emergencyChange",
-    rto_target: "rtoTarget",
-    edr_signal_noise: "edrNoise",
-    seg_zero_trust: "zeroTrust",
-    shadow_it: "shadowIT",
-    vendor_saas_critical: "singleVendorRisk",
-    tabletop_recent: "tabletop",
-  };
-  return mapping[id] || id;
-}
-
-function pickNextQuestion(state, askedSet){
-  const remaining = unansweredQuestions(state, askedSet);
-  if (remaining.length === 0) return null;
-  const scored = remaining.map(q => ({ q, voi: estimateVoI(q, state) }));
-  scored.sort((a,b)=> b.voi - a.voi);
-
-  // Simple branching: if immutable=false, prioritise restore test & throughput next
-  const imm = state.immutableBackups;
-  if (imm === false){
-    const pri = scored.find(s => ["restore_test_recency","restore_throughput_tbph"].includes(s.q.id));
-    if (pri) return pri.q;
-  }
-  return scored[0].q;
-}
-
-// ------------------------------ UI Components ------------------------------
-
-function Pill({children}){
-  return <span className="px-2 py-1 rounded-full bg-slate-100 text-slate-700 text-xs">{children}</span>
-}
-
-function Section({title, children, right}){
-  return (
-    <div className="bg-white rounded-2xl shadow p-4 md:p-6">
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg md:text-xl font-semibold">{title}</h2>
-        {right}
-      </div>
-      {children}
-    </div>
-  );
-}
-
-function NumberStat({label, value, suffix="h", accent=""}){
-  return (
-    <div className="flex flex-col items-start">
-      <div className="text-slate-500 text-sm">{label}</div>
-      <div className={`text-2xl md:text-3xl font-bold ${accent}`}>{value.toFixed(1)}{suffix}</div>
-    </div>
-  )
-}
-
-function Histogram({data}){
-  // simple SVG histogram
-  const width = 360, height = 120, padding = 20;
-  const nBins = 24;
-  if (!data || data.length === 0) return null;
-  const min = data[0];
-  const max = data[data.length - 1];
-  const binSize = (max - min) / nBins || 1;
-  const bins = new Array(nBins).fill(0);
-  data.forEach(v => {
-    const idx = clamp(Math.floor((v - min) / binSize), 0, nBins-1);
-    bins[idx] += 1;
-  });
-  const maxCount = Math.max(...bins);
-  const barWidth = (width - 2*padding) / nBins;
-  return (
-    <svg width={width} height={height} className="w-full">
-      {bins.map((c,i)=>{
-        const x = padding + i * barWidth;
-        const h = (c / maxCount) * (height - 2*padding);
-        const y = height - padding - h;
-        return <rect key={i} x={x} y={y} width={barWidth-2} height={h} rx={2} className="fill-slate-300" />
-      })}
-    </svg>
-  );
-}
-
-function QAInput({q, onSubmit}){
-  const [val, setVal] = useState("");
-  const [bool, setBool] = useState(false);
-  function handleSubmit(){
-    let out = val;
-    if (q.type === 'boolean') out = bool;
-    if (q.type === 'number') out = Number(val);
-    onSubmit(out);
-    setVal("");
-  }
-  return (
-    <div className="mt-2">
-      {q.type === 'boolean' && (
-        <div className="flex items-center gap-4">
-          <label className="flex items-center gap-2"><input type="radio" name={q.id} checked={bool===true} onChange={()=>setBool(true)} /> Yes</label>
-          <label className="flex items-center gap-2"><input type="radio" name={q.id} checked={bool===false} onChange={()=>setBool(false)} /> No</label>
+      const Pill = ({children}) => <span className="px-2 py-1 rounded-full bg-slate-100 text-slate-700 text-xs">{children}</span>;
+      const Section = ({title, children, right}) => (
+        <div className="bg-white rounded-2xl shadow p-4 md:p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg md:text-xl font-semibold">{title}</h2>
+            {right}
+          </div>
+          {children}
         </div>
-      )}
-      {q.type === 'single-select' && (
-        <select className="w-full border rounded-lg p-2" value={val} onChange={(e)=>setVal(e.target.value)}>
-          <option value="">Select...</option>
-          {q.options.map(o => <option key={o} value={o}>{o}</option>)}
-        </select>
-      )}
-      {q.type === 'number' && (
-        <div className="flex items-center gap-2">
-          <input className="w-40 border rounded-lg p-2" type="number" value={val} onChange={(e)=>setVal(e.target.value)} placeholder="Enter number" />
-          {q.unit && <span className="text-slate-500 text-sm">{q.unit}</span>}
+      );
+      const NumberStat = ({label, value, suffix="h", accent=""}) => (
+        <div className="flex flex-col items-start">
+          <div className="text-slate-500 text-sm">{label}</div>
+          <div className={"text-2xl md:text-3xl font-bold " + accent}>{value.toFixed(1)}{suffix}</div>
         </div>
-      )}
-      <div className="flex items-center gap-2 mt-3">
-        <button onClick={handleSubmit} disabled={q.type!=="boolean" && !val}
-          className="px-3 py-2 bg-slate-900 text-white rounded-lg hover:bg-slate-800">Submit</button>
-        {q.evidenceHint && <span className="text-slate-400 text-xs">Evidence: {q.evidenceHint}</span>}
-      </div>
-    </div>
-  );
-}
+      );
+      const Histogram = ({data}) => {
+        const width = 360, height = 120, padding = 20;
+        const nBins = 24;
+        if (!data || data.length === 0) return null;
+        const min = data[0];
+        const max = data[data.length - 1];
+        const binSize = (max - min) / nBins || 1;
+        const bins = new Array(nBins).fill(0);
+        data.forEach(v => {
+          const idx = clamp(Math.floor((v - min) / binSize), 0, nBins-1);
+          bins[idx] += 1;
+        });
+        const maxCount = Math.max(...bins);
+        const barWidth = (width - 2*padding) / nBins;
+        return (
+          <svg width={width} height={height} className="w-full">
+            {bins.map((c,i)=>{
+              const x = padding + i * barWidth;
+              const h = (c / maxCount) * (height - 2*padding);
+              const y = height - padding - h;
+              return <rect key={i} x={x} y={y} width={barWidth-2} height={h} rx={2} className="fill-slate-300" />;
+            })}
+          </svg>
+        );
+      };
+      const QAInput = ({q, onSubmit}) => {
+        const [val, setVal] = React.useState("");
+        const [bool, setBool] = React.useState(false);
+        function handleSubmit(){
+          let out = val;
+          if (q.type === 'boolean') out = bool;
+          if (q.type === 'number') out = Number(val);
+          onSubmit(out);
+          setVal("");
+        }
+        return (
+          <div className="mt-2">
+            {q.type === 'boolean' && (
+              <div className="flex items-center gap-4">
+                <label className="flex items-center gap-2"><input type="radio" name={q.id} checked={bool===true} onChange={()=>setBool(true)} /> Yes</label>
+                <label className="flex items-center gap-2"><input type="radio" name={q.id} checked={bool===false} onChange={()=>setBool(false)} /> No</label>
+              </div>
+            )}
+            {q.type === 'single-select' && (
+              <select className="w-full border rounded-lg p-2" value={val} onChange={(e)=>setVal(e.target.value)}>
+                <option value="">Select...</option>
+                {q.options.map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+            )}
+            {q.type === 'number' && (
+              <div className="flex items-center gap-2">
+                <input className="w-40 border rounded-lg p-2" type="number" value={val} onChange={(e)=>setVal(e.target.value)} placeholder="Enter number" />
+                {q.unit && <span className="text-slate-500 text-sm">{q.unit}</span>}
+              </div>
+            )}
+            <div className="flex items-center gap-2 mt-3">
+              <button onClick={handleSubmit} disabled={q.type!=="boolean" && !val} className="px-3 py-2 bg-slate-900 text-white rounded-lg hover:bg-slate-800">Submit</button>
+              {q.evidenceHint && <span className="text-slate-400 text-xs">Evidence: {q.evidenceHint}</span>}
+            </div>
+          </div>
+        );
+      };
+      const EvidenceUpload = ({onFiles}) => {
+        const ref = React.useRef();
+        return (
+          <div className="mt-2">
+            <input ref={ref} type="file" multiple onChange={(e)=>{
+              const files = Array.from(e.target.files || []).map(f => ({ name: f.name, size: f.size }))
+              onFiles(files);
+              if (ref.current) ref.current.value = null;
+            }} />
+            <div className="text-xs text-slate-400 mt-1">(Optional) Attach artefacts. Parsing is stubbed in this MVP.</div>
+          </div>
+        );
+      };
 
-function EvidenceUpload({onFiles}){
-  const ref = useRef();
-  return (
-    <div className="mt-2">
-      <input ref={ref} type="file" multiple onChange={(e)=>{
-        const files = Array.from(e.target.files || []).map(f => ({ name: f.name, size: f.size }))
-        onFiles(files);
-        if (ref.current) ref.current.value = null;
-      }} />
-      <div className="text-xs text-slate-400 mt-1">(Optional) Attach artefacts. Parsing is stubbed in this MVP.</div>
-    </div>
-  )
-}
+      function capabilityScoresWrapper(state){ return capabilityScores(state); } // alias for clarity
 
-// ------------------------------ Main App ------------------------------
+      function RecoveryTimeEstimator(){
+        const [state, setState] = useState(()=>{
+          try { return {...DEFAULT_STATE, ...(JSON.parse(localStorage.getItem('rte_session')||'{}'))}; } catch { return DEFAULT_STATE; }
+        });
+        const askedRef = useRef(new Set());
+        const [currentQ, setCurrentQ] = useState(null);
+        const [chat, setChat] = useState([]);
+        const [runs, setRuns] = useState(2000);
+        const sim = useMemo(()=> runSimulation(state, runs), [state, runs]);
+        const [sens, setSens] = useState(null);
 
-export default function RecoveryTimeEstimator(){
-  const [state, setState] = useState(()=>{
-    try { return {...DEFAULT_STATE, ...(JSON.parse(localStorage.getItem('rte_session')||'{}'))}; } catch { return DEFAULT_STATE; }
-  });
-  const askedRef = useRef(new Set());
-  const [currentQ, setCurrentQ] = useState(null);
-  const [chat, setChat] = useState([]); // {from:'system'|'user', text}
-  const [runs, setRuns] = useState(2000);
-  const sim = useMemo(()=> runSimulation(state, runs), [state, runs]);
-  const [sens, setSens] = useState(null);
+        useEffect(()=>{ localStorage.setItem('rte_session', JSON.stringify(state)); }, [state]);
 
-  // Persist
-  useEffect(()=>{
-    localStorage.setItem('rte_session', JSON.stringify(state));
-  }, [state]);
+        useEffect(()=>{
+          if (!currentQ){
+            const q = pickNextQuestion(state, askedRef);
+            setCurrentQ(q);
+            if (q) setChat(c => [...c, {from:'system', text: q.text, topic: q.topic}]);
+          }
+        }, [currentQ, state]);
 
-  // Init a question
-  useEffect(()=>{
-    if (!currentQ){
-      const q = pickNextQuestion(state, askedRef);
-      setCurrentQ(q);
-      if (q) setChat(c => [...c, {from:'system', text: q.text, topic: q.topic}]);
-    }
-  }, [currentQ, state]);
+        function answerQuestion(answer){
+          setChat(c => [...c, {from:'user', text: formatAnswer(currentQ, answer)}]);
+          const delta = currentQ.onAnswer(answer, state) || {};
+          setState(prev => ({ ...prev, ...delta }));
+          askedRef.current.add(currentQ.id);
+          const next = pickNextQuestion({...state, ...delta}, askedRef);
+          setCurrentQ(next);
+          if (next) setChat(c => [...c, {from:'system', text: next.text, topic: next.topic}]);
+        }
+        function formatAnswer(q, v){
+          if (q.type === 'boolean') return v ? 'Yes' : 'No';
+          if (q.type === 'number') return `${v} ${q.unit||''}`.trim();
+          return String(v||'');
+        }
+        function resetInterview(){ askedRef.current = new Set(); setChat([]); setCurrentQ(null); }
+        function runSensitivity(){ const s = sensitivityAnalysis(state); setSens(s); }
 
-  function answerQuestion(answer){
-    // Record to chat
-    setChat(c => [...c, {from:'user', text: formatAnswer(currentQ, answer)}]);
+        const caps = capabilityScoresWrapper(state);
+        const p = sim.params;
+        const rtoTarget = state.rtoTarget || 24;
+        const riskBadge = sim.p90 <= rtoTarget ? <Pill>On Target</Pill> : <Pill>Over Target</Pill>;
 
-    // Update state using onAnswer
-    const delta = currentQ.onAnswer(answer, state) || {};
-    setState(prev => ({ ...prev, ...delta }));
-
-    askedRef.current.add(currentQ.id);
-    const next = pickNextQuestion({...state, ...delta}, askedRef);
-    setCurrentQ(next);
-    if (next) setChat(c => [...c, {from:'system', text: next.text, topic: next.topic}]);
-  }
-
-  function formatAnswer(q, v){
-    if (q.type === 'boolean') return v ? 'Yes' : 'No';
-    if (q.type === 'number') return `${v} ${q.unit||''}`.trim();
-    return String(v||'');
-  }
-
-  function resetInterview(){
-    askedRef.current = new Set();
-    setChat([]);
-    setCurrentQ(null);
-  }
-
-  function runSensitivity(){
-    const s = sensitivityAnalysis(state);
-    setSens(s);
-  }
-
-  const caps = capabilityScores(state);
-  const p = sim.params;
-  const rtoTarget = state.rtoTarget || 24;
-  const riskBadge = sim.p90 <= rtoTarget ? <Pill>On Target</Pill> : <Pill>Over Target</Pill>;
-
-  return (
-    <div className="min-h-screen bg-slate-50">
-      <header className="bg-gradient-to-r from-slate-900 to-slate-700 text-white p-5 md:p-8">
-        <div className="max-w-6xl mx-auto">
-          <h1 className="text-2xl md:text-3xl font-bold">Recovery Time Estimator</h1>
-          <p className="text-slate-200 mt-1">Adaptive interview + Monte Carlo to predict recovery time and show the fastest improvements.</p>
-        </div>
-      </header>
-      <main className="max-w-6xl mx-auto p-4 md:p-8 grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2 space-y-6">
-          <Section title="Conversation">
-            <div className="h-72 overflow-y-auto space-y-3">
-              {chat.map((m,i)=> (
-                <div key={i} className={`flex ${m.from==='system'?'justify-start':'justify-end'}`}>
-                  <div className={`${m.from==='system'?'bg-white':'bg-slate-900 text-white'} rounded-2xl px-4 py-3 max-w-[80%] shadow`}>
-                    {m.topic && <div className="text-xs text-slate-400 mb-1">{m.topic}</div>}
-                    <div className="text-sm">{m.text}</div>
+        return (
+          <div className="min-h-screen bg-slate-50">
+            <header className="bg-gradient-to-r from-slate-900 to-slate-700 text-white p-5 md:p-8">
+              <div className="max-w-6xl mx-auto">
+                <h1 className="text-2xl md:text-3xl font-bold">Recovery Time Estimator</h1>
+                <p className="text-slate-200 mt-1">Adaptive interview + Monte Carlo to predict recovery time and show the fastest improvements.</p>
+              </div>
+            </header>
+            <main className="max-w-6xl mx-auto p-4 md:p-8 grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="lg:col-span-2 space-y-6">
+                <Section title="Conversation">
+                  <div className="h-72 overflow-y-auto space-y-3">
+                    {chat.map((m,i)=> (
+                      <div key={i} className={"flex " + (m.from==='system'?'justify-start':'justify-end')}>
+                        <div className={(m.from==='system'?'bg-white':'bg-slate-900 text-white') + " rounded-2xl px-4 py-3 max-w-[80%] shadow"}>
+                          {m.topic && <div className="text-xs text-slate-400 mb-1">{m.topic}</div>}
+                          <div className="text-sm">{m.text}</div>
+                        </div>
+                      </div>
+                    ))}
                   </div>
-                </div>
-              ))}
-            </div>
-            {currentQ ? (
-              <div className="mt-4">
-                <div className="font-medium">{currentQ.text}</div>
-                <QAInput q={currentQ} onSubmit={answerQuestion} />
-                <div className="mt-3">
-                  <EvidenceUpload onFiles={(files)=> setState(prev => ({...prev, evidence: [...prev.evidence, ...files]}))} />
-                </div>
-              </div>
-            ) : (
-              <div className="text-slate-500 text-sm mt-2">No more questions right now. You can revisit any inputs below or re-run sensitivity.</div>
-            )}
-            <div className="mt-4 flex items-center gap-2">
-              <button onClick={resetInterview} className="px-3 py-2 rounded-lg border">Restart interview</button>
-              <button onClick={()=>setRuns(r=> Math.min(20000, r+1000))} className="px-3 py-2 rounded-lg border">Increase runs (+1000)</button>
-              <span className="text-slate-500 text-xs">Runs: {runs}</span>
-            </div>
-          </Section>
-
-          <Section title="Inputs & What‑ifs" right={<Pill>Quick edit</Pill>}>
-            <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
-              {[
-                {k:'tier1Count', label:'Tier‑1 services', type:'number'},
-                {k:'totalTB', label:'Total TB to restore', type:'number'},
-                {k:'tbph', label:'Throughput (TB/h)', type:'number'},
-                {k:'concurrency', label:'Restore concurrency', type:'number'},
-                {k:'staffCount', label:'Available engineers', type:'number'},
-                {k:'uatCycles', label:'UAT cycles', type:'number'},
-                {k:'rtoTarget', label:'RTO target (h)', type:'number'},
-              ].map(inp => (
-                <div key={inp.k} className="flex items-center gap-2">
-                  <label className="w-40 text-slate-600">{inp.label}</label>
-                  <input className="flex-1 border rounded-lg p-2" type="number" value={state[inp.k]||''} onChange={(e)=> setState(s=> ({...s, [inp.k]: Number(e.target.value)}))} />
-                </div>
-              ))}
-            </div>
-            <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="p-3 border rounded-xl">
-                <div className="font-medium">Force Immutability</div>
-                <div className="text-xs text-slate-500 mb-2">Override answer for what‑if analysis.</div>
-                <div className="flex items-center gap-3">
-                  <button className={`px-2 py-1 rounded ${state.whatIf.forceImmutability===true?'bg-slate-900 text-white':'border'}`} onClick={()=> setState(s=> ({...s, whatIf:{...s.whatIf, forceImmutability: true}}))}>On</button>
-                  <button className={`px-2 py-1 rounded ${state.whatIf.forceImmutability===false?'bg-slate-900 text-white':'border'}`} onClick={()=> setState(s=> ({...s, whatIf:{...s.whatIf, forceImmutability: false}}))}>Off</button>
-                  <button className={`px-2 py-1 rounded ${state.whatIf.forceImmutability===null?'bg-slate-900 text-white':'border'}`} onClick={()=> setState(s=> ({...s, whatIf:{...s.whatIf, forceImmutability: null}}))}>Follow answers</button>
-                </div>
-              </div>
-              <div className="p-3 border rounded-xl">
-                <div className="font-medium">Force Cross‑Region</div>
-                <div className="text-xs text-slate-500 mb-2">Override DR rehearsal status.</div>
-                <div className="flex flex-wrap gap-2">
-                  {["No","Configured but not rehearsed","Rehearsed annually","Rehearsed quarterly", null].map(opt => (
-                    <button key={String(opt)}
-                      className={`px-2 py-1 rounded ${state.whatIf.forceCrossRegion===opt?'bg-slate-900 text-white':'border'}`}
-                      onClick={()=> setState(s=> ({...s, whatIf:{...s.whatIf, forceCrossRegion: opt}}))}>
-                      {opt===null?'Follow answers':opt}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="p-3 border rounded-xl">
-                <div className="font-medium">Add SREs (What‑if)</div>
-                <div className="text-xs text-slate-500 mb-2">Each ~+1 potential restore stream (staff‑gated).</div>
-                <input type="range" min={0} max={10} value={state.whatIf.addSREs}
-                  onChange={(e)=> setState(s=> ({...s, whatIf:{...s.whatIf, addSREs: Number(e.target.value)}}))} className="w-full" />
-                <div className="text-sm mt-1">+{state.whatIf.addSREs} SREs</div>
-              </div>
-            </div>
-          </Section>
-
-          <Section title="Sensitivity / Quick Wins" right={<button onClick={runSensitivity} className="px-3 py-1 rounded-lg border">Recalculate</button>}>
-            {!sens ? (
-              <div className="text-sm text-slate-500">Click Recalculate to see which actions most reduce P90 RTO.</div>
-            ) : (
-              <div className="space-y-2">
-                {sens.results.slice(0,6).map((r,i)=> (
-                  <div key={i} className="flex items-center justify-between bg-slate-100 rounded-xl p-3">
-                    <div className="font-medium">{r.label}</div>
-                    <div className="text-sm"><span className="text-emerald-700 font-semibold">-{r.deltaP90.toFixed(1)}h</span> → {r.newP90.toFixed(1)}h</div>
+                  {currentQ ? (
+                    <div className="mt-4">
+                      <div className="font-medium">{currentQ.text}</div>
+                      <QAInput q={currentQ} onSubmit={answerQuestion} />
+                      <div className="mt-3"><EvidenceUpload onFiles={(files)=> setState(prev => ({...prev, evidence: [...prev.evidence, ...files]}))} /></div>
+                    </div>
+                  ) : (
+                    <div className="text-slate-500 text-sm mt-2">No more questions right now. You can revisit any inputs below or re-run sensitivity.</div>
+                  )}
+                  <div className="mt-4 flex items-center gap-2">
+                    <button onClick={resetInterview} className="px-3 py-2 rounded-lg border">Restart interview</button>
+                    <button onClick={()=>setRuns(r=> Math.min(20000, r+1000))} className="px-3 py-2 rounded-lg border">Increase runs (+1000)</button>
+                    <span className="text-slate-500 text-xs">Runs: {runs}</span>
                   </div>
-                ))}
+                </Section>
+
+                <Section title="Inputs & What‑ifs" right={<Pill>Quick edit</Pill>}>
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
+                    {[
+                      {k:'tier1Count', label:'Tier‑1 services', type:'number'},
+                      {k:'totalTB', label:'Total TB to restore', type:'number'},
+                      {k:'tbph', label:'Throughput (TB/h)', type:'number'},
+                      {k:'concurrency', label:'Restore concurrency', type:'number'},
+                      {k:'staffCount', label:'Available engineers', type:'number'},
+                      {k:'uatCycles', label:'UAT cycles', type:'number'},
+                      {k:'rtoTarget', label:'RTO target (h)', type:'number'},
+                    ].map(inp => (
+                      <div key={inp.k} className="flex items-center gap-2">
+                        <label className="w-40 text-slate-600">{inp.label}</label>
+                        <input className="flex-1 border rounded-lg p-2" type="number" value={state[inp.k]||''} onChange={(e)=> setState(s=> ({...s, [inp.k]: Number(e.target.value)}))} />
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="p-3 border rounded-xl">
+                      <div className="font-medium">Force Immutability</div>
+                      <div className="text-xs text-slate-500 mb-2">Override answer for what‑if analysis.</div>
+                      <div className="flex items-center gap-3">
+                        <button className={(state.whatIf.forceImmutability===true?'bg-slate-900 text-white':'border') + " px-2 py-1 rounded"} onClick={()=> setState(s=> ({...s, whatIf:{...s.whatIf, forceImmutability: true}}))}>On</button>
+                        <button className={(state.whatIf.forceImmutability===false?'bg-slate-900 text-white':'border') + " px-2 py-1 rounded"} onClick={()=> setState(s=> ({...s, whatIf:{...s.whatIf, forceImmutability: false}}))}>Off</button>
+                        <button className={(state.whatIf.forceImmutability===null?'bg-slate-900 text-white':'border') + " px-2 py-1 rounded"} onClick={()=> setState(s=> ({...s, whatIf:{...s.whatIf, forceImmutability: null}}))}>Follow answers</button>
+                      </div>
+                    </div>
+                    <div className="p-3 border rounded-xl">
+                      <div className="font-medium">Force Cross‑Region</div>
+                      <div className="text-xs text-slate-500 mb-2">Override DR rehearsal status.</div>
+                      <div className="flex flex-wrap gap-2">
+                        {["No","Configured but not rehearsed","Rehearsed annually","Rehearsed quarterly", null].map(opt => (
+                          <button key={String(opt)} className={(state.whatIf.forceCrossRegion===opt?'bg-slate-900 text-white':'border') + " px-2 py-1 rounded"} onClick={()=> setState(s=> ({...s, whatIf:{...s.whatIf, forceCrossRegion: opt}}))}>
+                            {opt===null?'Follow answers':opt}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="p-3 border rounded-xl">
+                      <div className="font-medium">Add SREs (What‑if)</div>
+                      <div className="text-xs text-slate-500 mb-2">Each ~+1 potential restore stream (staff‑gated).</div>
+                      <input type="range" min={0} max={10} value={state.whatIf.addSREs} onChange={(e)=> setState(s=> ({...s, whatIf:{...s.whatIf, addSREs: Number(e.target.value)}}))} className="w-full" />
+                      <div className="text-sm mt-1">+{state.whatIf.addSREs} SREs</div>
+                    </div>
+                  </div>
+                </Section>
+
+                <Section title="Sensitivity / Quick Wins" right={<button onClick={runSensitivity} className="px-3 py-1 rounded-lg border">Recalculate</button>}>
+                  {!sens ? (
+                    <div className="text-sm text-slate-500">Click Recalculate to see which actions most reduce P90 RTO.</div>
+                  ) : (
+                    <div className="space-y-2">
+                      {sens.results.slice(0,6).map((r,i)=> (
+                        <div key={i} className="flex items-center justify-between bg-slate-100 rounded-xl p-3">
+                          <div className="font-medium">{r.label}</div>
+                          <div className="text-sm"><span className="text-emerald-700 font-semibold">-{r.deltaP90.toFixed(1)}h</span> → {r.newP90.toFixed(1)}h</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </Section>
               </div>
-            )}
-          </Section>
-        </div>
 
-        <div className="space-y-6">
-          <Section title="Estimate" right={riskBadge}>
-            <div className="grid grid-cols-2 gap-4">
-              <NumberStat label="P50 (median)" value={sim.p50} />
-              <NumberStat label="P90 (high confidence)" value={sim.p90} accent={sim.p90>rtoTarget?"text-red-600":"text-emerald-700"} />
-              <NumberStat label="Mean" value={sim.mean} />
-              <NumberStat label="Std Dev" value={sim.sd} />
-            </div>
-            <div className="mt-4">
-              <Histogram data={sim.samples} />
-              <div className="text-xs text-slate-500 mt-2">Distribution of total recovery time (hours) across {runs.toLocaleString()} runs.</div>
-            </div>
-          </Section>
+              <div className="space-y-6">
+                <Section title="Estimate" right={riskBadge}>
+                  <div className="grid grid-cols-2 gap-4">
+                    <NumberStat label="P50 (median)" value={sim.p50} />
+                    <NumberStat label="P90 (high confidence)" value={sim.p90} accent={sim.p90>rtoTarget?"text-red-600":"text-emerald-700"} />
+                    <NumberStat label="Mean" value={sim.mean} />
+                    <NumberStat label="Std Dev" value={sim.sd} />
+                  </div>
+                  <div className="mt-4">
+                    <Histogram data={sim.samples} />
+                    <div className="text-xs text-slate-500 mt-2">Distribution of total recovery time (hours) across {runs.toLocaleString()} runs.</div>
+                  </div>
+                </Section>
 
-          <Section title="Drivers & Params">
-            <div className="text-sm grid grid-cols-1 gap-2">
-              <div className="flex items-center justify-between"><span>Detect (mode)</span><span>{p.detect.mode.toFixed(0)} min</span></div>
-              <div className="flex items-center justify-between"><span>Governance (mode)</span><span>{p.governance.mode.toFixed(0)} min</span></div>
-              <div className="flex items-center justify-between"><span>Contain median</span><span>{(Math.exp(p.contain.mu)).toFixed(1)} h</span></div>
-              <div className="flex items-center justify-between"><span>Total TB</span><span>{p.restore.totalTB} TB</span></div>
-              <div className="flex items-center justify-between"><span>Throughput</span><span>{p.restore.tbph} TB/h</span></div>
-              <div className="flex items-center justify-between"><span>Concurrency</span><span>{p.restore.concurrency} streams</span></div>
-              <div className="flex items-center justify-between"><span>Rework probability</span><span>{(p.restore.reworkProb*100).toFixed(0)}%</span></div>
-              <div className="flex items-center justify-between"><span>Cutover</span><span>{p.cutoverHours.toFixed(1)} h</span></div>
-              <div className="flex items-center justify-between"><span>SaaS recovery</span><span>{p.saasHours.toFixed(1)} h</span></div>
-              <div className="flex items-center justify-between"><span>UAT total</span><span>{p.uatHours.toFixed(1)} h</span></div>
-              <div className="flex items-center justify-between"><span>Vendor/External</span><span>{p.vendorHours.toFixed(1)} h</span></div>
-            </div>
-          </Section>
+                <Section title="Drivers & Params">
+                  <div className="text-sm grid grid-cols-1 gap-2">
+                    <div className="flex items-center justify-between"><span>Detect (mode)</span><span>{sim.params.detect.mode.toFixed(0)} min</span></div>
+                    <div className="flex items-center justify-between"><span>Governance (mode)</span><span>{sim.params.governance.mode.toFixed(0)} min</span></div>
+                    <div className="flex items-center justify-between"><span>Contain median</span><span>{(Math.exp(sim.params.contain.mu)).toFixed(1)} h</span></div>
+                    <div className="flex items-center justify-between"><span>Total TB</span><span>{sim.params.restore.totalTB} TB</span></div>
+                    <div className="flex items-center justify-between"><span>Throughput</span><span>{sim.params.restore.tbph} TB/h</span></div>
+                    <div className="flex items-center justify-between"><span>Concurrency</span><span>{sim.params.restore.concurrency} streams</span></div>
+                    <div className="flex items-center justify-between"><span>Rework probability</span><span>{(sim.params.restore.reworkProb*100).toFixed(0)}%</span></div>
+                    <div className="flex items-center justify-between"><span>Cutover</span><span>{sim.params.cutoverHours.toFixed(1)} h</span></div>
+                    <div className="flex items-center justify-between"><span>SaaS recovery</span><span>{sim.params.saasHours.toFixed(1)} h</span></div>
+                    <div className="flex items-center justify-between"><span>UAT total</span><span>{sim.params.uatHours.toFixed(1)} h</span></div>
+                    <div className="flex items-center justify-between"><span>Vendor/External</span><span>{sim.params.vendorHours.toFixed(1)} h</span></div>
+                  </div>
+                </Section>
 
-          <Section title="Capability Scores">
-            <div className="grid grid-cols-2 gap-3 text-sm">
-              {Object.entries(caps).map(([k,v])=> (
-                <div key={k} className="bg-slate-100 rounded-xl p-3 flex items-center justify-between">
-                  <div>{CAPS[k] || k}</div>
-                  <div className="font-semibold">{v.toFixed(1)}/5</div>
-                </div>
-              ))}
-            </div>
-          </Section>
+                <Section title="Capability Scores">
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    {Object.entries(capabilityScoresWrapper(state)).map(([k,v])=> (
+                      <div key={k} className="bg-slate-100 rounded-xl p-3 flex items-center justify-between">
+                        <div>{CAPS[k] || k}</div>
+                        <div className="font-semibold">{v.toFixed(1)}/5</div>
+                      </div>
+                    ))}
+                  </div>
+                </Section>
 
-          <Section title="Export & Session">
-            <div className="flex items-center gap-2">
-              <button className="px-3 py-2 rounded-lg border"
-                onClick={()=> download(`rte-session-${new Date().toISOString().slice(0,19)}.json`, JSON.stringify({state, sim: {p50: sim.p50, p90: sim.p90, mean: sim.mean, sd: sim.sd}}, null, 2))}>Export JSON</button>
-              <button className="px-3 py-2 rounded-lg border" onClick={()=>{ localStorage.removeItem('rte_session'); location.reload(); }}>Clear storage</button>
-            </div>
-            {state.evidence?.length>0 && (
-              <div className="mt-3 text-xs text-slate-600">
-                <div className="font-semibold mb-1">Evidence attached:</div>
-                <ul className="list-disc ml-5 space-y-1">
-                  {state.evidence.map((e,i)=> <li key={i}>{e.name} — {(e.size/1024).toFixed(1)} KB</li>)}
-                </ul>
+                <Section title="Export & Session">
+                  <div className="flex items-center gap-2">
+                    <button className="px-3 py-2 rounded-lg border" onClick={()=> download(
+                      "rte-session-" + new Date().toISOString().slice(0,19) + ".json",
+                      JSON.stringify({state, sim: {p50: sim.p50, p90: sim.p90, mean: sim.mean, sd: sim.sd}}, null, 2)
+                    )}>Export JSON</button>
+                    <button className="px-3 py-2 rounded-lg border" onClick={()=>{ localStorage.removeItem('rte_session'); location.reload(); }}>Clear storage</button>
+                  </div>
+                  {state.evidence?.length>0 && (
+                    <div className="mt-3 text-xs text-slate-600">
+                      <div className="font-semibold mb-1">Evidence attached:</div>
+                      <ul className="list-disc ml-5 space-y-1">
+                        {state.evidence.map((e,i)=> <li key={i}>{e.name} — {(e.size/1024).toFixed(1)} KB</li>)}
+                      </ul>
+                    </div>
+                  )}
+                </Section>
               </div>
-            )}
-          </Section>
-        </div>
-      </main>
-      <footer className="text-center text-xs text-slate-400 py-6">MVP model for estimation only; calibrate with your clients’ exercise data.</footer>
-    </div>
-  );
-}
+            </main>
+            <footer className="text-center text-xs text-slate-400 py-6">MVP model for estimation only; calibrate with your clients’ exercise data.</footer>
+          </div>
+        );
+      }
+
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(<RecoveryTimeEstimator />);
+    </script>
+  </body>
+</html>
